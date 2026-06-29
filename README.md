@@ -117,3 +117,140 @@ Then fold into the folder: SWATTR — swap columns (`modelElementId,sentence` �
 `sentence_id,target_id`) into `model-doc/`; TransArC — `sentence,code` as-is into
 `doc-code/`; finally run `python3 normalize.py`. Dump test:
 `baseline-repos/transarc-icse24/ardoco+arcotl/tests/tests-tlr/src/test/java/.../integration/RawLinkDumpIT.java`.
+
+---
+
+# Unified archive — all three tasks + our approach
+
+The baseline files above cover two tasks (`doc-code`, `model-doc`) for SOTA systems
+only. `build_unified.py` generalizes this into one place that **also** holds the
+third link type (`model-code` / ArCoTL) and **our approach's** runs, organized so
+you can see exactly which running config produced each link set. Additive — it
+never rewrites the flat baseline CSVs above.
+
+## Tasks (well separated)
+
+| Folder | Link type | source → target | normalized header |
+|--------|-----------|-----------------|-------------------|
+| `model-doc/`  | **doc→model** (SAD-SAM)   | sentence → architecture-model element id | `sentence_id,target_id` |
+| `doc-code/`   | **doc→code** (SAD-Code)   | sentence → code file path | `sentence_id,target_id` |
+| `model-code/` | **model→code** (ArCoTL)   | model-element id → code file path | `source_id,target_id` |
+
+## Our approach (`aalinker`), organized by running config
+
+Native output is **doc→model**; **doc→code** is composed (our doc-model ∘ ArCoTL
+model-code), matching how `s_linker20` produces SAD-Code.
+
+```
+model-doc/aalinker/<backend>_<knowledge>/<run>/<project>.csv      # normalized
+                                          <project>.raw.csv        # verbatim extract (5 cols)
+doc-code/aalinker-composed/<backend>_<knowledge>/<run>/<project>.csv      # normalized
+                                                  <project>.raw.csv       # bridge: sentence_id,via_component,target_id
+```
+
+Config is encoded in the path — `backend` ∈ {`gpt-5.4`, `sonnet`}, `knowledge` =
+`full` (full-knowledge only; no-knowledge pending the paused Phase-51 sweep),
+`run` ∈ {run1,run2,run3}. Two source variants are tracked side by side:
+
+| config slot | source variant | role (D-04 REVISED) | builder |
+|-------------|----------------|---------------------|---------|
+| `gpt-5.4_full`, `sonnet_full` | `s_linker20_union` (v2.6.6 extracts) | baseline | `build_unified.py` |
+| `gpt-5.4_s21`, `sonnet_s21`   | **`s_linker21`** canonical Full (v2.6.6_extracts_s21[_sonnet]) | **paper Full** (gpt = body, sonnet = appendix mirror) | `build_s21_dump.py` |
+
+The `_manifest.csv` in each `aalinker*` dir records the `*_full` baseline config +
+provenance + row count + sha + (for model-doc) P/R/F1 vs gold; the S21 add-ons land in
+`_manifest_s21.csv` (gpt-5.4) and `_manifest_s21_sonnet.csv` (Claude).
+`UNIFIED_MANIFEST.csv` aggregates **every** per-task manifest (`_manifest.csv` +
+`_manifest_*.csv`), so it holds all four aalinker configs + arcotl (125 rows).
+
+## raw + normalized coexist
+
+Every generated link set ships **twice**, side by side: `<name>.csv` (normalized —
+deduped, sorted, `Implementation/` prefix stripped to match the existing baselines)
+and `<name>.raw.csv` (verbatim source, for integrity checks). The composed
+doc-code `.raw.csv` keeps the bridging component so each doc→code link is traceable
+back through the model layer.
+
+## Gold standards
+
+Vendored per task under `<task>/gold/<project>.csv` (+ `.raw.csv`) from the ARDoCo
+benchmark, so the folder is self-sufficient for scoring. Ground truth, not
+recovered — kept clearly separate.
+
+## model-code (ArCoTL)
+
+`model-code/arcotl/<project>.csv` — deterministic recovered model→code links from
+`transarc-emp/results/*/sam-code/`. Single set, shared by all our runs (the
+composition reuses it). No per-run/backend variation (heuristic, no LLM).
+
+## Doc→code scoring: enrollment modes (standard vs the others)
+
+The `doc-code` gold standard lists many targets at **directory/package**
+granularity (a row whose path ends in `/`, e.g. `…/registry/`), not individual
+files. How you reconcile package-level gold with file-level predictions is a
+*scoring* choice — it does not change the recovered links — and it moves the
+numbers a lot. Three modes exist; pick deliberately.
+
+| Mode | What it does | Implementation | Use |
+|------|--------------|----------------|-----|
+| **Enrolled** *(the standard — what the benchmark & TransArc/ARDoCo papers report)* | Expands each package gold row into one `(sentence, file)` pair per concrete code-model file under that prefix, then set P/R/F1. Recovering files under a package matches the enrolled pairs. | `metrics.enroll(gold, code_files)` → `metrics.prf`; headline `file_f1` in `metrics.compute_sad_code` | Headline numbers, comparability with prior work |
+| **No-enroll (atomic-package)** *(the un-inflated diagnostic)* | Each gold package counts as **one** atomic target. A predicted file collapses to the most-specific gold package it falls under (naming a package once satisfies it once — no multi-credit); predictions under no gold target stay as FPs. | `noenroll.py:noenroll_prf` | Measuring how much headline F1 is enrollment artifact |
+| **Strict / file-exact** *(naive; undercounts)* | Direct `(sentence, exact_file)` set equality, no expansion. A concrete predicted file never equals a package gold row, so package targets are unmatchable. | plain `prf` on raw gold | Not for headlines — illustrates why some reconciliation is needed |
+
+**Standard = enrolled.** The "others" are *no-enroll* (the honest middle ground
+the paper uses to expose inflation) and *strict* (the naive lower bound). The
+inflation gap `Δ = enrolled_F1 − noenroll_F1` is the quantity Ch2 critiques.
+
+### No-enroll vs enrolled, all systems (macro)
+
+| System | no-enroll F1 | enrolled F1 | Δ inflation |
+|--------|-------------:|------------:|------------:|
+| artemis (gpt-5.4)  | 0.632 | 0.849 | +0.217 |
+| transarc           | 0.391 | 0.803 | **+0.412** |
+| lissa (gpt-5-mini) | 0.138 | 0.198 | +0.060 |
+| **aalinker / s20U (ours)** | **0.682** | **0.906** | +0.224 |
+
+Full per-project breakdown + interpretation:
+`transarc-emp/reports/NOENROLL_DOC_CODE.md` (regenerate with
+`python3 transarc-emp/mini-src/noenroll.py`). Note enrollment does **not** preserve
+ranking — TransArc and artemis look close enrolled (.80/.85) but separate sharply
+no-enroll (.39/.63).
+
+## Integrity check (built in)
+
+Both builders recompute our model-doc P/R/F1 vs gold while building. `build_unified.py`
+reproduces the `s_linker20_union` band (gpt-5.4 ≈0.894, sonnet ≈0.928); `build_s21_dump.py`
+reproduces the canonical S21 Full band (gpt-5.4 **0.9360**, sonnet/Claude **0.9265**),
+confirming the vendored links match the source runs.
+
+## Regenerate
+
+```
+# baseline + s20_union full slots + arcotl bridge + gold (reads transarc-emp/results + benchmark)
+python3 build_unified.py
+
+# canonical S21 Full slots (gpt body + Claude appendix mirror); each pass also rebuilds
+# UNIFIED_MANIFEST.csv by aggregating every per-task manifest, so run order does not matter.
+# (git-tracked companion: transarc-emp/mini-src/build_s21_dump.py)
+cd ../../transarc-emp
+python3 mini-src/build_s21_dump.py                                          # gpt-5.4_s21
+EXTRACTS_S21=../agent-linker/results/v2.6.6_extracts_s21_sonnet \
+  S21_BE_DIR=sonnet S21_BE_TAG=claude S21_CONFIG=sonnet_s21 \
+  S21_MANIFEST_TAG=s21_sonnet python3 mini-src/build_s21_dump.py            # sonnet_s21
+```
+
+`build_s21_dump.py` reads gold + the ArCoTL bridge from the already-built dump here
+(not from `transarc-emp/results`), so it regenerates the S21 slots and the unified
+manifest even when the upstream `results/` tree is absent. End the regenerate sequence
+with `build_s21_dump.py` so `UNIFIED_MANIFEST.csv` includes the S21 rows.
+
+## Caveats specific to the unified additions
+
+1. **Composed doc-code uses *recovered* ArCoTL** (not gold model-code), mirroring
+   the real `s_linker20` SAD-Code pipeline. So its quality is bounded by the ArCoTL
+   model→code layer, which is the known SAM-Code bottleneck.
+2. **Path prefix.** Normalized code paths strip a leading `Implementation/` (aligns
+   our additions with the existing `transarc` doc-code files); the gold and Artemis
+   baselines keep it — match by suffix/prefix when scoring (see caveat 3 above).
+3. **No-knowledge runs absent.** Only full-knowledge `s_linker20_union` extracts are
+   clean today; add a `<backend>_noknow/` config tier once the Phase-51 sweep runs.
